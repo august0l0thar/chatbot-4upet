@@ -19,18 +19,16 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Modelo padrão atualizado para a versão 2.5-flash (mais estável e rápida)
-MODELO = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+MODELO = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 MODELO_EMBEDDING = os.getenv("EMBEDDING_MODEL", "gemini-embedding-2")
 DIMENSAO_EMBEDDING = int(os.getenv("EMBEDDING_DIM", "768"))
 
 LIMIAR_SIMILARIDADE = float(os.getenv("RAG_THRESHOLD", "0.70"))
-# Reduzido de 5 para 3 chunks para otimizar o consumo de tokens
-QUANTIDADE_CHUNKS = int(os.getenv("RAG_MATCH_COUNT", "3"))
+QUANTIDADE_CHUNKS = int(os.getenv("RAG_MATCH_COUNT", "5"))
 
 MSG_SEM_RESPOSTA = (
-    "🐾 Desculpe, não encontrei essa informação na base de conhecimento do 4UPet. "
-    "Para dúvidas sobre a saúde do seu pet, lembre-se de sempre consultar um médico-veterinário!"
+    "Não foi possível responder a essa pergunta porque não encontrei "
+    "essa informação na base de conhecimento veterinária."
 )
 
 if not GOOGLE_API_KEY:
@@ -81,6 +79,7 @@ class ChatbotResponse(BaseModel):
 def gerar_com_retry(tentativas=2, espera=10, **kwargs):
     """
     Repete a chamada apenas quando o Gemini retornar indisponibilidade/503.
+    Mantém o mesmo comportamento do notebook original.
     """
     for tentativa in range(1, tentativas + 1):
         try:
@@ -105,16 +104,16 @@ def resposta_de_erro(exc: Exception) -> ChatbotResponse:
 
     if "429" in erro or "RESOURCE_EXHAUSTED" in erro:
         mensagem = (
-            "⏳ O assistente está recebendo muitas perguntas no momento. "
-            "Aguarde alguns segundos e tente novamente!"
+            "[Aviso do Sistema]: Limite de uso da API atingido. "
+            "Tente novamente mais tarde."
         )
     elif "503" in erro or "UNAVAILABLE" in erro:
         mensagem = (
-            "📡 Os servidores da IA estão temporariamente ocupados. "
-            "Aguarde cerca de 1 a 2 minutos e tente novamente."
+            "[Aviso do Sistema]: Os servidores da IA estão sobrecarregados. "
+            "Aguarde um pouco e tente novamente."
         )
     else:
-        mensagem = "⚠️ Não foi possível processar a pergunta no momento. Tente novamente."
+        mensagem = "[Aviso do Sistema]: Não foi possível processar a pergunta."
 
     return ChatbotResponse(
         contexto_suficiente=False,
@@ -155,7 +154,9 @@ def consultar_chatbot_veterinario(
     # ------------------------------------------------------------------------
 
     try:
-        vetor_pergunta = embeddings.embed_query(pergunta_usuario)
+        vetor_pergunta = embeddings.embed_query(
+            pergunta_usuario
+        )
         print("Embedding gerado.")
     except Exception as exc:
         return resposta_de_erro(exc)
@@ -177,13 +178,16 @@ def consultar_chatbot_veterinario(
         docs = resposta_rpc.data or []
 
     except Exception as exc:
-        print(f"Erro no Supabase: {str(exc)[:300]}")
+        print(
+            "Erro no Supabase: "
+            f"{str(exc)[:300]}"
+        )
 
         return ChatbotResponse(
             contexto_suficiente=False,
             resposta=(
-                "⚠️ Ocorreu uma falha ao acessar a base de conhecimento. "
-                "Tente novamente em instantes."
+                "[Aviso do Sistema]: Não foi possível acessar "
+                "a base de conhecimento."
             ),
             fontes=[],
         )
@@ -206,7 +210,7 @@ def consultar_chatbot_veterinario(
         return resposta_sem_contexto()
 
     # ------------------------------------------------------------------------
-    # 4. MONTAR CONTEXTO E PROMPT OTIMIZADO
+    # 4. MONTAR CONTEXTO
     # ------------------------------------------------------------------------
 
     partes_contexto = []
@@ -222,16 +226,21 @@ def consultar_chatbot_veterinario(
 
     contexto = "\n".join(partes_contexto)
 
-    # Instruções do sistema movidas para a configuração do SDK para economizar tokens
-    instrucao_sistema = (
-        "Você é o assistente veterinário 4UPet.\n"
-        "Use APENAS as informações do CONTEXTO fornecido. Não use conhecimento próprio e não invente fatos.\n\n"
-        "- contexto_suficiente: true somente se o CONTEXTO responde DIRETAMENTE à pergunta. Se ele só trata de assuntos parecidos, marque false.\n"
-        "- Se for true, escreva em 'resposta' uma resposta clara em português e liste em 'fontes' os nomes das fontes usadas.\n"
-        "- Se for false, deixe 'resposta' vazia e 'fontes' como lista vazia."
-    )
+    prompt = f"""Você é o assistente veterinário 4UPet.
 
-    prompt = f"CONTEXTO:\n{contexto}\n\nPERGUNTA: {pergunta_usuario}"
+Use APENAS as informações do CONTEXTO abaixo. Não use conhecimento próprio
+e não invente fatos.
+
+- contexto_suficiente: true somente se o CONTEXTO responde DIRETAMENTE à
+  pergunta. Se ele só trata de assuntos parecidos, marque false.
+- Se for true, escreva em "resposta" uma resposta clara em português e
+  liste em "fontes" os nomes das fontes usadas.
+- Se for false, deixe "resposta" vazia e "fontes" como lista vazia.
+
+CONTEXTO:
+{contexto}
+
+PERGUNTA: {pergunta_usuario}"""
 
     # ------------------------------------------------------------------------
     # 5. GERAÇÃO DA RESPOSTA COM GEMINI
@@ -242,7 +251,6 @@ def consultar_chatbot_veterinario(
             model=MODELO,
             contents=prompt,
             config=types.GenerateContentConfig(
-                system_instruction=instrucao_sistema,
                 response_mime_type="application/json",
                 response_schema=RespostaRAG,
                 temperature=0.2,
@@ -260,10 +268,14 @@ def consultar_chatbot_veterinario(
         print("Não foi possível interpretar a resposta do modelo.")
         return resposta_sem_contexto()
 
+    # Dependendo da versão do SDK, parsed pode ser Pydantic ou dict.
     if isinstance(resultado, dict):
         resultado = RespostaRAG.model_validate(resultado)
 
-    print(f"contexto_suficiente={resultado.contexto_suficiente}")
+    print(
+        "contexto_suficiente="
+        f"{resultado.contexto_suficiente}"
+    )
 
     # ------------------------------------------------------------------------
     # 6. RESPOSTA FINAL
